@@ -11,6 +11,7 @@
 #define LUMIX_NO_CUSTOM_CRT
 #include <string.h>
 #include "core/allocator.h"
+#include "core/defer.h"
 #include "core/log.h"
 #include "core/os.h"
 #include "core/thread.h"
@@ -26,9 +27,7 @@
 #include "editor/world_editor.h"
 #include "engine/component_uid.h"
 
-#include "../../external/blink/src/coff_reader.hpp"
-#include "../../external/blink/src/pdb_reader.hpp"
-#include "../../external/blink/src/scoped_handle.hpp"
+#include "blink.h"
 
 #include <imgui/imgui.h>
 #include <Windows.h>
@@ -38,52 +37,41 @@
 using namespace Lumix;
 
 // from blink
-struct thread_scope_guard : scoped_handle
-{
-	thread_scope_guard() :
-		handle(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0))
-	{
-		if (handle == INVALID_HANDLE_VALUE)
-			return;
+struct thread_scope_guard  {
+	thread_scope_guard() 
+		: handle(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0))
+	{ 
+		if (handle == INVALID_HANDLE_VALUE) return;
 
 		THREADENTRY32 te = { sizeof(te) };
 
-		if (Thread32First(handle, &te) && te.dwSize >= FIELD_OFFSET(THREADENTRY32, th32ThreadID) + sizeof(te.th32ThreadID))
-		{
-			do
-			{
-				if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == GetCurrentThreadId())
+		if (Thread32First(handle, &te) && te.dwSize >= FIELD_OFFSET(THREADENTRY32, th32ThreadID) + sizeof(te.th32ThreadID)) {
+			do {
+				if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == GetCurrentThreadId()) 
 					continue; // Do not suspend the current thread (which belongs to blink)
 
-				const scoped_handle thread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+				HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
 
-				if (thread == nullptr)
-					continue;
-
-				SuspendThread(thread);
+				if (thread) SuspendThread(thread);
+				CloseHandle(thread);
 			} while (Thread32Next(handle, &te));
 		}
 	}
-	~thread_scope_guard()
-	{
-		if (handle == INVALID_HANDLE_VALUE)
-			return;
+
+	~thread_scope_guard() {
+		if (handle == INVALID_HANDLE_VALUE) return;
 
 		THREADENTRY32 te = { sizeof(te) };
 
-		if (Thread32First(handle, &te) && te.dwSize >= FIELD_OFFSET(THREADENTRY32, th32ThreadID) + sizeof(te.th32ThreadID))
-		{
-			do
-			{
+		if (Thread32First(handle, &te) && te.dwSize >= FIELD_OFFSET(THREADENTRY32, th32ThreadID) + sizeof(te.th32ThreadID)) {
+			do {
 				if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == GetCurrentThreadId())
 					continue;
 
-				const scoped_handle thread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+				HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
 
-				if (thread == nullptr)
-					continue;
-
-				ResumeThread(thread);
+				if (thread) ResumeThread(thread);
+				CloseHandle(thread);
 			} while (Thread32Next(handle, &te));
 		}
 	}
@@ -158,16 +146,13 @@ struct LiveCodeEditorPlugin : StudioApp::IPlugin, StudioApp::GUIPlugin {
 			return;
 		}
 
-		blink::pdb_reader pdb(debug_data->path);
-		if (pdb.guid() != debug_data->guid) {
+		m_symbols.insert({ "__ImageBase", m_image_base });
+		if (!blink::read_symbol_table(debug_data->path, debug_data->guid, m_image_base, m_symbols)) {
 			logError("Debug data mismatch.");
 			return;
 		}
 
 		logInfo("Found PDB: ", debug_data->path);
-		pdb.read_object_files(m_object_files);
-		m_symbols.insert({ "__ImageBase", m_image_base });
-		pdb.read_symbol_table(m_image_base, m_symbols);
 
 		parseProjectFiles();
 
@@ -267,8 +252,8 @@ struct LiveCodeEditorPlugin : StudioApp::IPlugin, StudioApp::GUIPlugin {
 
 	// from blink
 	template <typename SYMBOL_TYPE, typename HEADER_TYPE>
-	bool link(HANDLE file, const HEADER_TYPE& header) {
-		thread_scope_guard _scope_guard_;
+	bool link(Lumix::os::InputFile& file, const HEADER_TYPE& header) {
+		thread_scope_guard scope_guard;
 		os::Timer timer;
 
 		if (header.Machine != IMAGE_FILE_MACHINE_AMD64) {
@@ -277,26 +262,29 @@ struct LiveCodeEditorPlugin : StudioApp::IPlugin, StudioApp::GUIPlugin {
 		}
 
 		// Read section headers from input file (there is no optional header in COFF files, so it is right after the header read above)
-		std::vector<IMAGE_SECTION_HEADER> sections(header.NumberOfSections);
-		if (DWORD read; !ReadFile(file, sections.data(), header.NumberOfSections * sizeof(IMAGE_SECTION_HEADER), &read, nullptr)) {
+		Array<IMAGE_SECTION_HEADER> sections(m_app.getAllocator());
+		sections.resize(header.NumberOfSections);
+		if (!file.read(sections.data(), header.NumberOfSections * sizeof(IMAGE_SECTION_HEADER))) {
 			logError("Failed to read an image file sections.");
 			return false;
 		}
 
 		// Read symbol table from input file
-		SetFilePointer(file, header.PointerToSymbolTable, nullptr, FILE_BEGIN);
-
-		std::vector<SYMBOL_TYPE> symbols(header.NumberOfSymbols);
-		if (DWORD read; !ReadFile(file, symbols.data(), header.NumberOfSymbols * sizeof(SYMBOL_TYPE), &read, nullptr)) {
+		Array<SYMBOL_TYPE> symbols(m_app.getAllocator());
+		symbols.resize(header.NumberOfSymbols);
+		if (!file.seek(header.PointerToSymbolTable) ||
+			!file.read(symbols.data(), header.NumberOfSymbols * sizeof(SYMBOL_TYPE)))
+		{
 			logError("Failed to read an image file symbols.");
 			return false;
 		}
 
 		// The string table follows after the symbol table and is usually at the end of the file
-		const DWORD string_table_size = GetFileSize(file, nullptr) - (header.PointerToSymbolTable + header.NumberOfSymbols * sizeof(SYMBOL_TYPE));
+		const DWORD string_table_size = (DWORD)file.size() - (header.PointerToSymbolTable + header.NumberOfSymbols * sizeof(SYMBOL_TYPE));
 
-		std::vector<char> strings(string_table_size);
-		if (DWORD read; !ReadFile(file, strings.data(), string_table_size, &read, nullptr)) {
+		OutputMemoryStream strings(m_app.getAllocator());
+		strings.resize(string_table_size);
+		if (!file.read(strings.getMutableData(), string_table_size)) {
 			logError("Failed to read a string table.");
 			return false;
 		}
@@ -342,9 +330,8 @@ struct LiveCodeEditorPlugin : StudioApp::IPlugin, StudioApp::GUIPlugin {
 
 			// Uninitialized sections do not have any data attached and they were already zeroed by 'VirtualAlloc', so skip them here
 			if (section.PointerToRawData != 0) {
-				SetFilePointer(file, section.PointerToRawData, nullptr, FILE_BEGIN);
-
-				if (DWORD read; !ReadFile(file, section_base, section.SizeOfRawData, &read, nullptr))
+				if (!file.seek(section.PointerToRawData) ||
+					!file.read(section_base, section.SizeOfRawData))
 				{
 					logError("Failed to read a section raw data.");
 					return false;
@@ -356,9 +343,8 @@ struct LiveCodeEditorPlugin : StudioApp::IPlugin, StudioApp::GUIPlugin {
 
 			// Read any relocation data attached to this section
 			if (section.PointerToRelocations != 0) {
-				SetFilePointer(file, section.PointerToRelocations, nullptr, FILE_BEGIN);
-
-				if (DWORD read; !ReadFile(file, section_base, section.NumberOfRelocations * sizeof(IMAGE_RELOCATION), &read, nullptr))
+				if (!file.seek(section.PointerToRelocations) ||
+					!file.read(section_base, section.NumberOfRelocations * sizeof(IMAGE_RELOCATION)))
 				{
 					logError("Failed to read relocations.");
 					return false;
@@ -370,8 +356,9 @@ struct LiveCodeEditorPlugin : StudioApp::IPlugin, StudioApp::GUIPlugin {
 		}
 
 		// Resolve internal and external symbols
-		std::vector<BYTE*> local_symbol_addresses(header.NumberOfSymbols);
-		std::vector<std::pair<BYTE*, const BYTE*>> image_function_relocations;
+		Array<BYTE*> local_symbol_addresses(m_app.getAllocator());
+		local_symbol_addresses.resize(header.NumberOfSymbols);
+		Array<std::pair<BYTE*, const BYTE*>> image_function_relocations(m_app.getAllocator());
 
 		u32 num_new_functions = 0;
 		for (DWORD i = 0; i < header.NumberOfSymbols; i++) {
@@ -383,7 +370,7 @@ struct LiveCodeEditorPlugin : StudioApp::IPlugin, StudioApp::GUIPlugin {
 			if (symbol.N.Name.Short == 0) {
 				ASSERT(symbol.N.Name.Long < string_table_size);
 
-				symbol_name = strings.data() + symbol.N.Name.Long;
+				symbol_name = (const char*)strings.data() + symbol.N.Name.Long;
 			}
 			else {
 				const auto short_name = reinterpret_cast<const char*>(symbol.N.ShortName);
@@ -434,7 +421,8 @@ struct LiveCodeEditorPlugin : StudioApp::IPlugin, StudioApp::GUIPlugin {
 
 						if (ISFCN(symbol.Type))
 						{
-							image_function_relocations.push_back({ old_address, target_address });
+							image_function_relocations.push({ old_address, target_address });
+							// logInfo("Relocation ", symbol_name.c_str());
 						}
 						else if (strcmp(reinterpret_cast<const char*>(section.Name), ".bss") == 0 || strcmp(reinterpret_cast<const char*>(section.Name), ".data") == 0)
 						{
@@ -444,6 +432,7 @@ struct LiveCodeEditorPlugin : StudioApp::IPlugin, StudioApp::GUIPlugin {
 					}
 					else if (ISFCN(symbol.Type)) {
 						++num_new_functions;
+						// logInfo("New function ", symbol_name.c_str());
 					}
 				}
 			}
@@ -520,13 +509,13 @@ struct LiveCodeEditorPlugin : StudioApp::IPlugin, StudioApp::GUIPlugin {
 	}
 
 	// from blink
-	bool link(const std::filesystem::path& path)
-	{
-		logInfo("Relinking ", path.u8string().c_str());
+	bool link(const char* path) {
+		logInfo("Relinking ", path);
 		// Object file can be a normal COFF or an extended COFF
-		COFF_HEADER header;
-		const scoped_handle file = open_coff_file(path, header);
-		if (file == INVALID_HANDLE_VALUE) return false;
+		blink::COFF_HEADER header;
+		os::InputFile file;
+		if (!open_coff_file(path, header, file)) return false;
+		defer { file.close(); };
 
 		return !header.is_extended() ?
 			link<IMAGE_SYMBOL>(file, header.obj) :
@@ -557,7 +546,7 @@ struct LiveCodeEditorPlugin : StudioApp::IPlugin, StudioApp::GUIPlugin {
 		, m_to_reload(app.getAllocator())
 		, m_msbuild_path(app.getAllocator())
 	{
-		m_app.getSettings().registerOption("livecode_opend", &m_is_open);
+		m_app.getSettings().registerOption("livecode_open", &m_is_open);
 	}
 
 	void openTab(const SourceFile& src_file) {
@@ -606,15 +595,37 @@ struct LiveCodeEditorPlugin : StudioApp::IPlugin, StudioApp::GUIPlugin {
 				os::Timer timer;
 				logInfo("Building modified source file ", source_file.path, " ...");
 				
-				String args("/t:ClCompile /p:Configuration=Debug /p:Platform=x64 ", m_app.getAllocator());
-				args.append("/p:SelectedFiles=");
-				args.append(source_file.path);
-				args.append(" ");
-				args.append(source_file.project);
-				args.append(".vcxproj");
-				os::shellExecuteOpen(m_msbuild_path, args.c_str(), m_sln_dir, false);
+				String cmd(m_app.getAllocator());
+				cmd.append(m_msbuild_path, " /verbosity:minimal /t:ClCompile /p:Configuration=Debug /p:Platform=x64 ");
+				cmd.append("/p:SelectedFiles=");
+				cmd.append(source_file.path);
+				cmd.append(" ");
+				cmd.append(source_file.project);
+				cmd.append(".vcxproj");
+				os::Process* process = os::createProcess(m_app.getAllocator(), cmd, m_sln_dir);
 
-				logInfo("Built in ", timer.getTimeSinceStart(), " seconds.");
+				// TODO async
+				if (process) {
+					char buf[4096];
+					while (!os::isFinished(*process)) {
+						u32 read = os::readStdOutput(*process, Span(buf, buf + sizeof(buf) - 1));
+						if (read != 0) {
+							buf[read] = 0;
+							logInfo(buf);
+						}
+						else {
+							os::sleep(10);
+						}
+					}
+					i32 ret_code = os::getReturnCode(*process);
+					if (ret_code != 0) logError("Failed to compile.");
+					os::destroyProcess(*process);
+					logInfo("Built in ", timer.getTimeSinceStart(), " seconds.");
+				}
+				else {
+					logError("Failed to spawn compiler process.");
+				}
+				
 			}
 		}
 	}
@@ -634,11 +645,29 @@ struct LiveCodeEditorPlugin : StudioApp::IPlugin, StudioApp::GUIPlugin {
 
 		m_to_reload.clear();
 	}
+	
 
 	void onGUI() override {
 		if (m_app.checkShortcut(m_build, true)) buildModifiedSource();
 		if (m_app.checkShortcut(m_toggle_ui, true)) m_is_open = !m_is_open;
 		if (!m_is_open) return;
+		
+		if (m_is_symbols_open) {
+			ImGui::SetNextWindowSize(ImVec2(200, 200), ImGuiCond_FirstUseEver);
+			if (ImGui::Begin("LiveCode - Symbols", &m_is_symbols_open)) {
+				m_filter.gui("Filter");
+				ImGui::Separator();
+				if (ImGui::BeginChild("list")) {
+					for (const auto& symbol : m_symbols) {
+						if (m_filter.pass(symbol.first.c_str())) {
+							ImGui::TextUnformatted(symbol.first.c_str());
+						}
+					}
+				}
+				ImGui::EndChild();
+			}
+			ImGui::End();
+		}
 		
 		ImGui::SetNextWindowSize(ImVec2(200, 200), ImGuiCond_FirstUseEver);
 		bool save_request = false;
@@ -646,12 +675,14 @@ struct LiveCodeEditorPlugin : StudioApp::IPlugin, StudioApp::GUIPlugin {
 			if (m_app.getCommonActions().save.iconButton()) save_request = true;
 			ImGui::SameLine();
 			if (m_build.iconButton()) buildModifiedSource();
+			ImGui::SameLine();
+			if (ImGuiEx::IconButton(ICON_FA_LIST, "List symbols")) m_is_symbols_open = true;
+			
 			ImGui::Columns(2);
-			static TextFilter filter;
-			filter.gui("Filter");
+			m_filter.gui("Filter");
 			ImGui::BeginChild("left_col");
 			for (const SourceFile& source_file: m_source_files) {
-				if (filter.pass(source_file.path)) {
+				if (m_filter.pass(source_file.path)) {
 					StringView basename = Path::getBasename(source_file.path);
 					if (ImGui::Selectable(basename.begin, false, ImGuiSelectableFlags_AllowDoubleClick) && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
 						openTab(source_file);
@@ -703,9 +734,9 @@ struct LiveCodeEditorPlugin : StudioApp::IPlugin, StudioApp::GUIPlugin {
 	Action m_toggle_ui{"LiveCode", "LiveCode", "Toggle UI", "livecode_toggle_ui", nullptr, Action::WINDOW};
 	Action m_build{"LiveCode", "Rebuild modified sources", "Rebuild modified sources", "livecode_build", ICON_FA_RECYCLE, Action::NORMAL};
 	bool m_is_open = false;
+	bool m_is_symbols_open = false;
 
 	BYTE* m_image_base;
-	std::vector<std::filesystem::path> m_object_files;
 	std::unordered_map<std::string, void*> m_symbols;
 	UniquePtr<FileSystemWatcher> m_watcher;
 	StaticString<MAX_PATH> m_objs_path;
@@ -716,6 +747,7 @@ struct LiveCodeEditorPlugin : StudioApp::IPlugin, StudioApp::GUIPlugin {
 	Array<SourceFile> m_source_files;
 	Array<FileTab> m_tabs;
 	String m_msbuild_path;
+	TextFilter m_filter;
 };
 
 
